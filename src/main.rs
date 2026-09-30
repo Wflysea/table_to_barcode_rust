@@ -8,6 +8,10 @@
 //! 支持的条码类型：code128, code39, ean13, ean8, upca
 //! （一维条码只能编码 ASCII / 数字，中文列会被跳过）
 
+// 发布版（release）编译为 Windows GUI 子系统，避免双击运行时弹出黑色控制台窗口。
+// 调试版（cargo run）保留控制台，方便查看 println! 输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
@@ -512,7 +516,7 @@ impl eframe::App for AppState {
             if self.headers.is_empty() {
                 ui.label("（请先读取列名）");
             } else {
-                egui::ComboBox::from_label("")
+                egui::ComboBox::from_id_salt("barcode_col")
                     .show_index(ui, &mut self.col_idx, self.headers.len(), |i| {
                         self.headers.get(i).cloned().unwrap_or_default()
                     });
@@ -524,7 +528,7 @@ impl eframe::App for AppState {
 
         ui.horizontal(|ui| {
             ui.label("条码类型");
-            egui::ComboBox::from_label("").show_index(ui, &mut self.type_idx, BARCODE_TYPES.len(), |i| {
+            egui::ComboBox::from_id_salt("barcode_type").show_index(ui, &mut self.type_idx, BARCODE_TYPES.len(), |i| {
                 BARCODE_TYPES[i].to_string()
             });
         });
@@ -592,9 +596,14 @@ fn main() -> Result<(), eframe::Error> {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(2);
         match run_selftest(&excel, &out, hrow) {
-            Ok(msg) => println!("{}", msg),
+            Ok(msg) => {
+                println!("{}", msg);
+                // windows 子系统下无控制台，同时写入文件便于排查
+                let _ = std::fs::write("selftest_log.txt", &msg);
+            }
             Err(e) => {
                 eprintln!("selftest error: {}", e);
+                let _ = std::fs::write("selftest_log.txt", format!("selftest error: {}", e));
                 std::process::exit(1);
             }
         }
