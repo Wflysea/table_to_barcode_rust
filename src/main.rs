@@ -28,6 +28,8 @@ use rfd::FileDialog;
 const DEFAULT_BAR_WIDTH: u32 = 350;
 /// 条码图片高度默认值（像素）
 const DEFAULT_BAR_HEIGHT: u32 = 150;
+/// 条码左右留白（边距）默认值（像素）：条码实际宽度 = 图片宽度 - 边距
+const DEFAULT_BAR_MARGIN: u32 = 100;
 /// 文字高度（像素）
 const FONT_SIZE: f32 = 26.0;
 
@@ -227,6 +229,7 @@ fn generate_barcodes(
     start_row: usize,
     bar_width: u32,
     bar_height: u32,
+    bar_margin: u32,
     font_data: &Option<Vec<u8>>,
 ) -> Result<(usize, Vec<(usize, String, String)>)> {
     std::fs::create_dir_all(out_dir).context("创建导出目录失败")?;
@@ -269,20 +272,28 @@ fn generate_barcodes(
                 continue;
             }
         };
-        // 将生成的条码缩放到用户设定的像素尺寸（宽度/高度可在界面配置）
+        // 将生成的条码缩放到「图片宽度 - 边距」的实际宽度，再水平居中贴到
+        // 一张宽为 bar_width 的白色画布上，从而得到左右各 (边距/2) 的留白
         let bytes = {
             let bars = image::load_from_memory(&raw)
                 .context("解析条码图片失败")?
                 .to_rgba8();
-            let resized = image::imageops::resize(
+            let inner_w = bar_width.saturating_sub(bar_margin).max(1);
+            let bar_img = image::imageops::resize(
                 &bars,
-                bar_width,
+                inner_w,
                 bar_height,
                 image::imageops::FilterType::Nearest,
             );
+            let mut canvas = image::RgbaImage::new(bar_width, bar_height);
+            for p in canvas.pixels_mut() {
+                *p = image::Rgba([255u8, 255, 255, 255]);
+            }
+            let offset_x = (bar_width.saturating_sub(inner_w)) / 2;
+            image::imageops::replace(&mut canvas, &bar_img, offset_x as i64, 0);
             // write_to 要求写入目标实现 Write + Seek，用 Cursor<Vec<u8>> 包装
             let mut cursor = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgba8(resized)
+            image::DynamicImage::ImageRgba8(canvas)
                 .write_to(&mut cursor, image::ImageFormat::Png)
                 .context("编码条码图片失败")?;
             cursor.into_inner()
@@ -369,6 +380,7 @@ fn run_selftest(excel: &str, out_arg: &str, header_row: usize) -> Result<String>
         header_row + 1,
         DEFAULT_BAR_WIDTH,
         DEFAULT_BAR_HEIGHT,
+        DEFAULT_BAR_MARGIN,
         &find_font(),
     )?;
     log.push(format!("[RESULT] 成功 {} 张，跳过 {} 张", count, skipped.len()));
@@ -392,6 +404,7 @@ struct AppState {
     start_row: usize,
     bar_width: u32,
     bar_height: u32,
+    bar_margin: u32,
     status: String,
     busy: bool,
     font_data: Option<Vec<u8>>,
@@ -417,6 +430,7 @@ impl AppState {
             start_row: 3,
             bar_width: DEFAULT_BAR_WIDTH,
             bar_height: DEFAULT_BAR_HEIGHT,
+            bar_margin: DEFAULT_BAR_MARGIN,
             status: "请选择 Excel 文件并开始。".into(),
             busy: false,
             font_data: find_font(),
@@ -468,6 +482,7 @@ impl AppState {
         let with_text = self.with_text;
         let bar_width = self.bar_width;
         let bar_height = self.bar_height;
+        let bar_margin = self.bar_margin;
         let font_data = self.font_data.clone();
 
         match analyze_column(&path, col_idx, start_row) {
@@ -497,7 +512,7 @@ impl AppState {
         self.rx = Some(rx);
         thread::spawn(move || {
             let res = generate_barcodes(
-                &path, col_idx, &out, btype, with_text, start_row, bar_width, bar_height, &font_data,
+                &path, col_idx, &out, btype, with_text, start_row, bar_width, bar_height, bar_margin, &font_data,
             );
             let outcome = match res {
                 Ok((count, skipped)) => {
@@ -575,6 +590,8 @@ impl eframe::App for AppState {
             ui.add(egui::DragValue::new(&mut self.bar_width).range(50..=2000));
             ui.label("条码高度(px)");
             ui.add(egui::DragValue::new(&mut self.bar_height).range(20..=1000));
+            ui.label("边距(px)");
+            ui.add(egui::DragValue::new(&mut self.bar_margin).range(0..=1000));
         });
 
         ui.checkbox(&mut self.with_text, "显示文字");

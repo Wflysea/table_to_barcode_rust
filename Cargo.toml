@@ -1,6 +1,6 @@
 [package]
 name = "barcode_tool"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
 description = "从 Excel 指定列生成一维条形码图片（Rust 重写版）"
 license = "MIT"
