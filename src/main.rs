@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
@@ -77,9 +78,10 @@ fn register_cjk_font(ctx: &egui::Context) {
     for p in candidates {
         if let Ok(bytes) = std::fs::read(p) {
             let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
             if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                 proportional.push("cjk".to_owned());
             }
@@ -96,7 +98,7 @@ fn read_headers(path: &str, header_row: usize) -> Result<Vec<String>> {
     let range = wb
         .worksheet_range_at(0)
         .ok_or_else(|| anyhow!("工作簿中没有工作表"))??;
-    let rows = range.rows();
+    let rows: Vec<&[Data]> = range.rows().collect();
     if header_row == 0 || header_row > rows.len() {
         return Ok(Vec::new());
     }
@@ -123,7 +125,7 @@ fn read_column(path: &str, col_index: usize, start_row: usize) -> Result<Vec<(us
     let range = wb
         .worksheet_range_at(0)
         .ok_or_else(|| anyhow!("工作簿中没有工作表"))??;
-    let rows = range.rows();
+    let rows: Vec<&[Data]> = range.rows().collect();
     let mut out = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let excel_row = i + 1;
@@ -194,7 +196,7 @@ fn compose_with_text(
         *p = image::Rgba([255u8, 255, 255, 255]);
     }
     image::imageops::replace(&mut out, &bars, 0, 0);
-    let tw = imageproc::text::text_size(scale, &font, text).width as i32;
+    let tw = imageproc::drawing::text_size(scale, &font, text).0 as i32;
     let x = ((w as i32 - tw) / 2).max(0);
     imageproc::drawing::draw_text_mut(
         &mut out,
