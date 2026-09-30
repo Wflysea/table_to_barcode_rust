@@ -1,6 +1,6 @@
 [package]
 name = "barcode_tool"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 description = "从 Excel 指定列生成一维条形码图片（Rust 重写版）"
 license = "MIT"
@@ -17,5 +17,10 @@ anyhow = "1"
 open = "5"
 
 [profile.release]
-opt-level = 3
+# 体积优先优化：opt-level=z 按体积而非速度优化；lto+codegen-units=1 跨 crate 内联去重；
+# panic=abort 去掉 unwind 运行时；strip 去除调试符号。
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
 strip = true

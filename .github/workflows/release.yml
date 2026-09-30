@@ -52,6 +52,16 @@ jobs:
           name: barcode_tool
           path: target/x86_64-pc-windows-msvc/release/barcode_tool.exe
 
+      - name: Compress with UPX (size reduction)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile upx.zip
+          Expand-Archive -Path upx.zip -DestinationPath upx -Force
+          .\upx\upx-4.2.4-win64\upx.exe --best --lzma target/x86_64-pc-windows-msvc/release/barcode_tool.exe
+          echo "--- UPX 压缩后大小 ---"
+          (Get-Item target/x86_64-pc-windows-msvc/release/barcode_tool.exe).Length
+
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
