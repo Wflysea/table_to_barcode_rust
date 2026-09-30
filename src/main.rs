@@ -24,8 +24,10 @@ use calamine::{open_workbook_auto, Data, Reader};
 use eframe::egui;
 use rfd::FileDialog;
 
-/// 条码图片高度（像素）
-const BARCODE_HEIGHT: u32 = 140;
+/// 条码图片宽度默认值（像素）
+const DEFAULT_BAR_WIDTH: u32 = 350;
+/// 条码图片高度默认值（像素）
+const DEFAULT_BAR_HEIGHT: u32 = 150;
 /// 文字高度（像素）
 const FONT_SIZE: f32 = 26.0;
 
@@ -223,6 +225,8 @@ fn generate_barcodes(
     btype: &str,
     with_text: bool,
     start_row: usize,
+    bar_width: u32,
+    bar_height: u32,
     font_data: &Option<Vec<u8>>,
 ) -> Result<(usize, Vec<(usize, String, String)>)> {
     std::fs::create_dir_all(out_dir).context("创建导出目录失败")?;
@@ -257,13 +261,30 @@ fn generate_barcodes(
             }
         };
 
-        let png = BarcodeImage::png(BARCODE_HEIGHT);
-        let bytes = match png.generate(&encoded[..]) {
+        let png = BarcodeImage::png(bar_height);
+        let raw = match png.generate(&encoded[..]) {
             Ok(b) => b,
             Err(e) => {
                 skipped.push((row, value.clone(), format!("保存失败: {}", e)));
                 continue;
             }
+        };
+        // 将生成的条码缩放到用户设定的像素尺寸（宽度/高度可在界面配置）
+        let bytes = {
+            let bars = image::load_from_memory(&raw)
+                .context("解析条码图片失败")?
+                .to_rgba8();
+            let resized = image::imageops::resize(
+                &bars,
+                bar_width,
+                bar_height,
+                image::imageops::FilterType::Nearest,
+            );
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(resized)
+                .write_to(&mut buf, image::ImageFormat::Png)
+                .context("编码条码图片失败")?;
+            buf
         };
 
         let base = safe_name(&value);
@@ -338,8 +359,17 @@ fn run_selftest(excel: &str, out_arg: &str, header_row: usize) -> Result<String>
         out_arg.to_string()
     };
 
-    let (count, skipped) =
-        generate_barcodes(excel, idx, &out_dir, "code128", true, header_row + 1, &find_font())?;
+    let (count, skipped) = generate_barcodes(
+        excel,
+        idx,
+        &out_dir,
+        "code128",
+        true,
+        header_row + 1,
+        DEFAULT_BAR_WIDTH,
+        DEFAULT_BAR_HEIGHT,
+        &find_font(),
+    )?;
     log.push(format!("[RESULT] 成功 {} 张，跳过 {} 张", count, skipped.len()));
     for s in skipped.iter().take(10) {
         log.push(format!("   跳过 行{}: {:?} -> {}", s.0, s.1, s.2));
@@ -359,6 +389,8 @@ struct AppState {
     with_text: bool,
     header_row: usize,
     start_row: usize,
+    bar_width: u32,
+    bar_height: u32,
     status: String,
     busy: bool,
     font_data: Option<Vec<u8>>,
@@ -382,6 +414,8 @@ impl AppState {
             with_text: true,
             header_row: 2,
             start_row: 3,
+            bar_width: DEFAULT_BAR_WIDTH,
+            bar_height: DEFAULT_BAR_HEIGHT,
             status: "请选择 Excel 文件并开始。".into(),
             busy: false,
             font_data: find_font(),
@@ -431,6 +465,8 @@ impl AppState {
         let header_row = self.header_row;
         let start_row = self.start_row;
         let with_text = self.with_text;
+        let bar_width = self.bar_width;
+        let bar_height = self.bar_height;
         let font_data = self.font_data.clone();
 
         match analyze_column(&path, col_idx, start_row) {
@@ -460,7 +496,7 @@ impl AppState {
         self.rx = Some(rx);
         thread::spawn(move || {
             let res = generate_barcodes(
-                &path, col_idx, &out, btype, with_text, start_row, &font_data,
+                &path, col_idx, &out, btype, with_text, start_row, bar_width, bar_height, &font_data,
             );
             let outcome = match res {
                 Ok((count, skipped)) => {
@@ -531,6 +567,13 @@ impl eframe::App for AppState {
             egui::ComboBox::from_id_salt("barcode_type").show_index(ui, &mut self.type_idx, BARCODE_TYPES.len(), |i| {
                 BARCODE_TYPES[i].to_string()
             });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("条码宽度(px)");
+            ui.add(egui::DragValue::new(&mut self.bar_width).range(50..=2000));
+            ui.label("条码高度(px)");
+            ui.add(egui::DragValue::new(&mut self.bar_height).range(20..=1000));
         });
 
         ui.checkbox(&mut self.with_text, "显示文字");
