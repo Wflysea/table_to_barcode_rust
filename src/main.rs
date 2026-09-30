@@ -280,11 +280,12 @@ fn generate_barcodes(
                 bar_height,
                 image::imageops::FilterType::Nearest,
             );
-            let mut buf = Vec::new();
+            // write_to 要求写入目标实现 Write + Seek，用 Cursor<Vec<u8>> 包装
+            let mut cursor = std::io::Cursor::new(Vec::new());
             image::DynamicImage::ImageRgba8(resized)
-                .write_to(&mut buf, image::ImageFormat::Png)
+                .write_to(&mut cursor, image::ImageFormat::Png)
                 .context("编码条码图片失败")?;
-            buf
+            cursor.into_inner()
         };
 
         let base = safe_name(&value);
