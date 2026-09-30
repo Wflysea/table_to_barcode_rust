@@ -1,0 +1,58 @@
+name: Build and Release (Windows)
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build (release)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Self-test (core logic)
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -m pip install --quiet openpyxl
+          python - <<'PY'
+          import openpyxl
+          wb = openpyxl.Workbook(); ws = wb.active
+          ws.append(["货场退货报表"])
+          ws.append(["序号", "物品编码", "物品名称", "数量", "扫码"])
+          for i, c in enumerate(
+              ["6901234567890", "6901234567891", "6901234567892",
+               "6901234567893", "6901234567894"], 1):
+              ws.append([i, c, "商品%d" % i, 10, "2026-09-09"])
+          wb.save("sample.xlsx")
+          PY
+          ./target/x86_64-pc-windows-msvc/release/barcode_tool.exe --selftest sample.xlsx selftest_out 2
+          echo "--- generated files ---"
+          ls selftest_out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: barcode_tool
+          path: target/x86_64-pc-windows-msvc/release/barcode_tool.exe
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: target/x86_64-pc-windows-msvc/release/barcode_tool.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
