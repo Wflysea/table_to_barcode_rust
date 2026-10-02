@@ -99,41 +99,96 @@ fn register_cjk_font(ctx: &egui::Context) {
     }
 }
 
-/// 读取工作簿第一个工作表的指定行作为表头（header_row 为 1 基行号）
-fn read_headers(path: &str, header_row: usize) -> Result<Vec<String>> {
+/// 读取整个表格为「行→列→文本」的二维结构（统一处理 Excel 与 CSV）。
+/// - .csv 走自写的 read_table_csv（自动嗅探分隔符 + GBK/GB18030 中文解码）
+/// - 其它（xlsx/xls）走 calamine
+fn load_table(path: &str) -> Result<Vec<Vec<String>>> {
+    if path.to_ascii_lowercase().ends_with(".csv") {
+        return read_table_csv(path);
+    }
     let mut wb = open_workbook_auto(path)
         .with_context(|| format!("无法打开文件: {}", path))?;
     let range = wb
         .worksheet_range_at(0)
         .ok_or_else(|| anyhow!("工作簿中没有工作表"))??;
     let rows: Vec<&[Data]> = range.rows().collect();
+    Ok(rows
+        .iter()
+        .map(|r| r.iter().map(cell_text).collect())
+        .collect())
+}
+
+/// 把文件字节解码为 UTF-8 字符串：优先按 UTF-8，失败则回退到 GBK/GB18030（中文 CSV 常见）
+fn decode_bytes(bytes: &[u8]) -> String {
+    let b = if bytes.starts_with(b"\xef\xbb\xbf") {
+        &bytes[3..]
+    } else {
+        bytes
+    };
+    match std::str::from_utf8(b) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GB18030.decode_without_bom_handling(b).0.to_string(),
+    }
+}
+
+/// 嗅探 CSV 分隔符：扫描首个非空行，选择出现次数最多的候选（, \t ; |），默认逗号
+fn detect_delimiter(text: &str) -> u8 {
+    let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let candidates: &[u8] = &[b',', b'\t', b';', b'|'];
+    let mut best = b',';
+    let mut best_count = 0usize;
+    for &d in candidates {
+        let c = first_line.as_bytes().iter().filter(|&&x| x == d).count();
+        if c > best_count {
+            best_count = c;
+            best = d;
+        }
+    }
+    best
+}
+
+/// 读取 CSV 文件为二维文本表（支持带引号字段、GBK/GB18030 编码、任意常见分隔符）
+fn read_table_csv(path: &str) -> Result<Vec<Vec<String>>> {
+    let bytes = std::fs::read(path).with_context(|| format!("无法读取文件: {}", path))?;
+    let text = decode_bytes(&bytes);
+    let delim = detect_delimiter(&text);
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(delim)
+        .flexible(true)
+        .has_headers(false)
+        .from_reader(text.as_bytes());
+    let mut rows = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec.map_err(|e| anyhow!("CSV 解析失败: {}", e))?;
+        rows.push(rec.iter().map(|s| s.to_string()).collect());
+    }
+    Ok(rows)
+}
+
+/// 读取工作表的指定行作为表头（header_row 为 1 基行号）
+fn read_headers(path: &str, header_row: usize) -> Result<Vec<String>> {
+    let rows = load_table(path)?;
     if header_row == 0 || header_row > rows.len() {
         return Ok(Vec::new());
     }
-    let row = rows[header_row - 1];
-    let headers: Vec<String> = row
+    let row = &rows[header_row - 1];
+    Ok(row
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let t = cell_text(c);
+            let t = c.trim().to_string();
             if t.is_empty() {
                 format!("列{}", i + 1)
             } else {
                 t
             }
         })
-        .collect();
-    Ok(headers)
+        .collect())
 }
 
 /// 读取指定列（从 start_row 行起）的非空单元格，返回 (Excel行号, 文本)
 fn read_column(path: &str, col_index: usize, start_row: usize) -> Result<Vec<(usize, String)>> {
-    let mut wb = open_workbook_auto(path)
-        .with_context(|| format!("无法打开文件: {}", path))?;
-    let range = wb
-        .worksheet_range_at(0)
-        .ok_or_else(|| anyhow!("工作簿中没有工作表"))??;
-    let rows: Vec<&[Data]> = range.rows().collect();
+    let rows = load_table(path)?;
     let mut out = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let excel_row = i + 1;
@@ -143,7 +198,7 @@ fn read_column(path: &str, col_index: usize, start_row: usize) -> Result<Vec<(us
         if col_index >= row.len() {
             continue;
         }
-        let t = cell_text(&row[col_index]).trim().to_string();
+        let t = row[col_index].trim().to_string();
         if t.is_empty() {
             continue;
         }
@@ -419,6 +474,11 @@ struct GenOutcome {
 impl AppState {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         register_cjk_font(&cc.egui_ctx);
+        // 使用浅色高对比主题，避免默认深色（近黑）背景导致文字难以辨认
+        let mut visuals = egui::Visuals::light();
+        visuals.window_fill = egui::Color32::from_rgb(250, 250, 252);
+        visuals.panel_fill = egui::Color32::from_rgb(240, 242, 246);
+        cc.egui_ctx.set_visuals(visuals);
         Self {
             excel_path: String::new(),
             out_dir: String::new(),
@@ -431,7 +491,7 @@ impl AppState {
             bar_width: DEFAULT_BAR_WIDTH,
             bar_height: DEFAULT_BAR_HEIGHT,
             bar_margin: DEFAULT_BAR_MARGIN,
-            status: "请选择 Excel 文件并开始。".into(),
+            status: "请选择表格文件（Excel 或 CSV）并开始。".into(),
             busy: false,
             font_data: find_font(),
             rx: None,
@@ -440,7 +500,7 @@ impl AppState {
 
     fn load_cols(&mut self) {
         if self.excel_path.is_empty() {
-            self.status = "请先选择 Excel 文件。".into();
+            self.status = "请先选择表格文件（Excel 或 CSV）。".into();
             return;
         }
         self.start_row = self.header_row + 1;
@@ -462,7 +522,7 @@ impl AppState {
 
     fn generate(&mut self) {
         if self.excel_path.is_empty() {
-            self.status = "请选择 Excel 文件。".into();
+            self.status = "请选择表格文件（Excel 或 CSV）。".into();
             return;
         }
         if self.headers.is_empty() {
@@ -546,15 +606,15 @@ impl AppState {
 impl eframe::App for AppState {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.label(
-            "选择 Excel 文件 → 读取列名并选择条形码列 → 选择导出目录 → 生成。\n（列名行/数据起始行可调：默认列名在第 2 行、数据从第 3 行开始）",
+            "选择表格文件（Excel 或 CSV）→ 读取列名并选择条形码列 → 选择导出目录 → 生成。\n（列名行/数据起始行可调：默认列名在第 2 行、数据从第 3 行开始）",
         );
 
         ui.horizontal(|ui| {
-            ui.label("Excel 文件");
+            ui.label("表格文件");
             ui.text_edit_singleline(&mut self.excel_path);
             if ui.button("浏览…").clicked() {
                 if let Some(p) = FileDialog::new()
-                    .add_filter("Excel", &["xlsx", "xls"])
+                    .add_filter("表格文件", &["xlsx", "xls", "csv"])
                     .pick_file()
                 {
                     self.excel_path = p.to_string_lossy().to_string();
@@ -676,7 +736,7 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
     eframe::run_native(
-        "Excel 指定列生成条形码工具 (Rust)",
+        "表格转条形码工具 (Rust)",
         options,
         Box::new(|cc| Ok(Box::new(AppState::new(cc)))),
     )
