@@ -280,24 +280,32 @@ fn compose_with_text(
 /// 把 RGBA 图像编码为带 DPI 物理尺寸元数据（PNG pHYs 块）的 PNG 字节。
 /// dpi 仅用于写入元数据（打印时按此分辨率换算物理尺寸），不缩放图像本身。
 /// 像素/米 = DPI × 1000 / 25.4 = DPI × 10000 / 254。
+///
+/// 注意：png::Encoder 会“取得”写入目标的所有权，finish() 后无法再取回 Cursor，
+/// 因此这里把 `&mut Vec<u8>` 作为写入目标（借用而非拥有），finish 后字节留在 Vec 中。
 fn encode_png_with_dpi(img: &image::RgbaImage, dpi: u32) -> Result<Vec<u8>> {
     let ppm = ((dpi as f64) * 10000.0 / 254.0).round() as u32;
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    let mut encoder = png::Encoder::new(cursor, img.width(), img.height());
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_pixel_dims(Some(png::PixelDimensions {
-        xppu: ppm,
-        yppu: ppm,
-        unit: png::Unit::Meter,
-    }));
-    let mut writer = encoder
-        .write_header()
-        .map_err(|e| anyhow!("PNG 编码失败: {}", e))?;
-    writer
-        .write_image_data(img.as_raw())
-        .map_err(|e| anyhow!("PNG 写入失败: {}", e))?;
-    Ok(cursor.into_inner())
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, img.width(), img.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_pixel_dims(Some(png::PixelDimensions {
+            xppu: ppm,
+            yppu: ppm,
+            unit: png::Unit::Meter,
+        }));
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| anyhow!("PNG 编码失败: {}", e))?;
+        writer
+            .write_image_data(img.as_raw())
+            .map_err(|e| anyhow!("PNG 写入失败: {}", e))?;
+        writer
+            .finish()
+            .map_err(|e| anyhow!("PNG 收尾失败: {}", e))?;
+    }
+    Ok(buf)
 }
 
 /// 把 RGBA 图像保存为带 DPI 物理尺寸元数据的 PNG 文件。
