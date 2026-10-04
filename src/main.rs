@@ -33,7 +33,7 @@ const DEFAULT_BAR_MARGIN: u32 = 100;
 /// 文字高度（像素）
 const FONT_SIZE: f32 = 26.0;
 /// 默认打印分辨率（DPI）：用于把像素换算成毫米，并写入 PNG 物理尺寸（pHYs）元数据
-const DEFAULT_DPI: u32 = 300;
+const DEFAULT_DPI: u32 = 120;
 /// 默认最小模块（最窄条）宽度（毫米）：低于此值会自动放大像素，保证条码可扫描
 const DEFAULT_MIN_MODULE_MM: f32 = 0.4;
 
