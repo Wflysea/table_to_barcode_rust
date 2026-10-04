@@ -32,6 +32,10 @@ const DEFAULT_BAR_HEIGHT: u32 = 150;
 const DEFAULT_BAR_MARGIN: u32 = 100;
 /// 文字高度（像素）
 const FONT_SIZE: f32 = 26.0;
+/// 默认打印分辨率（DPI）：用于把像素换算成毫米，并写入 PNG 物理尺寸（pHYs）元数据
+const DEFAULT_DPI: u32 = 300;
+/// 默认最小模块（最窄条）宽度（毫米）：低于此值会自动放大像素，保证条码可扫描
+const DEFAULT_MIN_MODULE_MM: f32 = 0.4;
 
 /// 支持的条码类型
 const BARCODE_TYPES: &[&str] = &["code128", "code39", "ean13", "ean8", "upca"];
@@ -273,8 +277,38 @@ fn compose_with_text(
     Ok(out)
 }
 
+/// 把 RGBA 图像编码为带 DPI 物理尺寸元数据（PNG pHYs 块）的 PNG 字节。
+/// dpi 仅用于写入元数据（打印时按此分辨率换算物理尺寸），不缩放图像本身。
+/// 像素/米 = DPI × 1000 / 25.4 = DPI × 10000 / 254。
+fn encode_png_with_dpi(img: &image::RgbaImage, dpi: u32) -> Result<Vec<u8>> {
+    let ppm = ((dpi as f64) * 10000.0 / 254.0).round() as u32;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut encoder = png::Encoder::new(cursor, img.width(), img.height());
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_pixel_dims(Some(png::PixelDimensions {
+        xppu: ppm,
+        yppu: ppm,
+        unit: png::Unit::Meter,
+    }));
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| anyhow!("PNG 编码失败: {}", e))?;
+    writer
+        .write_image_data(img.as_raw())
+        .map_err(|e| anyhow!("PNG 写入失败: {}", e))?;
+    Ok(cursor.into_inner())
+}
+
+/// 把 RGBA 图像保存为带 DPI 物理尺寸元数据的 PNG 文件。
+fn save_png_with_dpi(img: &image::RgbaImage, path: &Path, dpi: u32) -> Result<()> {
+    let bytes = encode_png_with_dpi(img, dpi)?;
+    std::fs::write(path, bytes).with_context(|| format!("写入文件失败: {}", path.display()))?;
+    Ok(())
+}
+
 /// 生成条形码主函数。
-/// 返回 (成功数量, 跳过列表[(行号, 值, 原因)])
+/// 返回 (成功数量, 跳过列表[(行号, 值, 原因)], 实际最小模块宽度(mm))
 fn generate_barcodes(
     path: &str,
     col_index: usize,
@@ -285,13 +319,17 @@ fn generate_barcodes(
     bar_width: u32,
     bar_height: u32,
     bar_margin: u32,
+    dpi: u32,
+    min_module_mm: f32,
     font_data: &Option<Vec<u8>>,
-) -> Result<(usize, Vec<(usize, String, String)>)> {
+) -> Result<(usize, Vec<(usize, String, String)>, f32)> {
     std::fs::create_dir_all(out_dir).context("创建导出目录失败")?;
     let cells = read_column(path, col_index, start_row)?;
     let mut count = 0;
     let mut skipped: Vec<(usize, String, String)> = Vec::new();
     let mut used: HashMap<String, u32> = HashMap::new();
+    // 记录整批生成中实际的最小模块（最窄条）像素宽度，用于换算成毫米回显给用户
+    let mut min_module_px_actual: u32 = u32::MAX;
 
     for (row, value) in cells {
         // 数字型条码长度校验
@@ -328,30 +366,42 @@ fn generate_barcodes(
             }
         };
         // 将生成的条码缩放到「图片宽度 - 边距」的实际宽度，再水平居中贴到
-        // 一张宽为 bar_width 的白色画布上，从而得到左右各 (边距/2) 的留白
+        // 一张宽为 bar_width 的白色画布上，从而得到左右各 (边距/2) 的留白。
+        // 同时保证最窄条（模块）的物理宽度 >= min_module_mm（按 dpi 换算）。
         let bytes = {
             let bars = image::load_from_memory(&raw)
                 .context("解析条码图片失败")?
                 .to_rgba8();
-            let inner_w = bar_width.saturating_sub(bar_margin).max(1);
+            // barcoders 生成的位图宽度为「模块数」（每模块 1px），据此可得模块像素宽度
+            let num_modules = encoded.len() as u32;
+            let inner_w_user = bar_width.saturating_sub(bar_margin).max(1);
+            // 满足最小物理宽度所需的最小模块像素宽度（向上取整，至少 1px）
+            let min_module_px = ((min_module_mm * dpi as f32 / 25.4).ceil().max(1.0)) as u32;
+            // 用户设定意图下的模块像素宽度（取上限），再与最小要求取较大值
+            let module_px = if num_modules > 0 {
+                let desired = ((inner_w_user as f32 / num_modules as f32).ceil()).max(1.0) as u32;
+                desired.max(min_module_px)
+            } else {
+                min_module_px
+            };
+            min_module_px_actual = min_module_px_actual.min(module_px);
+            // 让实际宽度为模块数的整数倍，保证每个模块等宽（扫描更可靠）
+            let inner_w = num_modules.saturating_mul(module_px).max(1);
+            let bar_width_actual = inner_w + bar_margin;
             let bar_img = image::imageops::resize(
                 &bars,
                 inner_w,
                 bar_height,
                 image::imageops::FilterType::Nearest,
             );
-            let mut canvas = image::RgbaImage::new(bar_width, bar_height);
+            let mut canvas = image::RgbaImage::new(bar_width_actual, bar_height);
             for p in canvas.pixels_mut() {
                 *p = image::Rgba([255u8, 255, 255, 255]);
             }
-            let offset_x = (bar_width.saturating_sub(inner_w)) / 2;
+            let offset_x = (bar_width_actual.saturating_sub(inner_w)) / 2;
             image::imageops::replace(&mut canvas, &bar_img, offset_x as i64, 0);
-            // write_to 要求写入目标实现 Write + Seek，用 Cursor<Vec<u8>> 包装
-            let mut cursor = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgba8(canvas)
-                .write_to(&mut cursor, image::ImageFormat::Png)
-                .context("编码条码图片失败")?;
-            cursor.into_inner()
+            // 写入带 DPI 物理尺寸元数据的 PNG（保证打印尺寸正确）
+            encode_png_with_dpi(&canvas, dpi).context("编码条码图片失败")?
         };
 
         let base = safe_name(&value);
@@ -367,8 +417,7 @@ fn generate_barcodes(
         if with_text {
             match compose_with_text(&bytes, &value, font_data) {
                 Ok(img) => {
-                    image::DynamicImage::ImageRgba8(img)
-                        .save_with_format(&fpath, image::ImageFormat::Png)?;
+                    save_png_with_dpi(&img, &fpath, dpi)?;
                 }
                 Err(_) => {
                     std::fs::write(&fpath, bytes)?;
@@ -379,7 +428,13 @@ fn generate_barcodes(
         }
         count += 1;
     }
-    Ok((count, skipped))
+    // 整批实际最小模块宽度（毫米）= 最小模块像素 / dpi × 25.4
+    let min_module_mm_actual = if min_module_px_actual == u32::MAX {
+        0.0
+    } else {
+        min_module_px_actual as f32 * 25.4 / dpi as f32
+    };
+    Ok((count, skipped, min_module_mm_actual))
 }
 
 /// 无界面自检：用于验证生成流程是否可用
@@ -426,7 +481,7 @@ fn run_selftest(excel: &str, out_arg: &str, header_row: usize) -> Result<String>
         out_arg.to_string()
     };
 
-    let (count, skipped) = generate_barcodes(
+    let (count, skipped, min_mm) = generate_barcodes(
         excel,
         idx,
         &out_dir,
@@ -436,9 +491,14 @@ fn run_selftest(excel: &str, out_arg: &str, header_row: usize) -> Result<String>
         DEFAULT_BAR_WIDTH,
         DEFAULT_BAR_HEIGHT,
         DEFAULT_BAR_MARGIN,
+        DEFAULT_DPI,
+        DEFAULT_MIN_MODULE_MM,
         &find_font(),
     )?;
-    log.push(format!("[RESULT] 成功 {} 张，跳过 {} 张", count, skipped.len()));
+    log.push(format!(
+        "[RESULT] 成功 {} 张，跳过 {} 张；最小模块宽度 ≈ {:.3} mm（要求 ≥ {:.2} mm @ {} DPI）",
+        count, skipped.len(), min_mm, DEFAULT_MIN_MODULE_MM, DEFAULT_DPI
+    ));
     for s in skipped.iter().take(10) {
         log.push(format!("   跳过 行{}: {:?} -> {}", s.0, s.1, s.2));
     }
@@ -460,6 +520,8 @@ struct AppState {
     bar_width: u32,
     bar_height: u32,
     bar_margin: u32,
+    dpi: u32,
+    min_module_mm: f32,
     status: String,
     busy: bool,
     font_data: Option<Vec<u8>>,
@@ -491,6 +553,8 @@ impl AppState {
             bar_width: DEFAULT_BAR_WIDTH,
             bar_height: DEFAULT_BAR_HEIGHT,
             bar_margin: DEFAULT_BAR_MARGIN,
+            dpi: DEFAULT_DPI,
+            min_module_mm: DEFAULT_MIN_MODULE_MM,
             status: "请选择表格文件（Excel 或 CSV）并开始。".into(),
             busy: false,
             font_data: find_font(),
@@ -543,6 +607,8 @@ impl AppState {
         let bar_width = self.bar_width;
         let bar_height = self.bar_height;
         let bar_margin = self.bar_margin;
+        let dpi = self.dpi;
+        let min_module_mm = self.min_module_mm;
         let font_data = self.font_data.clone();
 
         match analyze_column(&path, col_idx, start_row) {
@@ -572,10 +638,10 @@ impl AppState {
         self.rx = Some(rx);
         thread::spawn(move || {
             let res = generate_barcodes(
-                &path, col_idx, &out, btype, with_text, start_row, bar_width, bar_height, bar_margin, &font_data,
+                &path, col_idx, &out, btype, with_text, start_row, bar_width, bar_height, bar_margin, dpi, min_module_mm, &font_data,
             );
             let outcome = match res {
-                Ok((count, skipped)) => {
+                Ok((count, skipped, min_mm)) => {
                     let mut s = format!("✅ 生成完成：成功 {} 张", count);
                     if !skipped.is_empty() {
                         s.push_str(&format!("，跳过 {} 张", skipped.len()));
@@ -587,6 +653,10 @@ impl AppState {
                         s.push_str("\n⚠️ 部分被跳过（一维条码无法编码中文，请改用数字编码列）。\n");
                         s.push_str(&sample.join("\n"));
                     }
+                    s.push_str(&format!(
+                        "\n最小模块宽度 ≈ {:.3} mm（要求 ≥ {:.2} mm @ {} DPI）",
+                        min_mm, min_module_mm, dpi
+                    ));
                     s.push_str(&format!("\n导出目录：{}", out));
                     GenOutcome {
                         status: s,
@@ -652,6 +722,14 @@ impl eframe::App for AppState {
             ui.add(egui::DragValue::new(&mut self.bar_height).range(20..=1000));
             ui.label("边距(px)");
             ui.add(egui::DragValue::new(&mut self.bar_margin).range(0..=1000));
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("打印分辨率(DPI)");
+            ui.add(egui::DragValue::new(&mut self.dpi).range(72..=1200));
+            ui.label("最小模块宽(mm)");
+            ui.add(egui::DragValue::new(&mut self.min_module_mm).range(0.1..=5.0).speed(0.05));
+            ui.label("（最窄条物理宽度下限，不足自动放大）");
         });
 
         ui.checkbox(&mut self.with_text, "显示文字");
