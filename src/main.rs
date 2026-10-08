@@ -546,8 +546,9 @@ impl AppState {
         register_cjk_font(&cc.egui_ctx);
         // 使用浅色高对比主题，避免默认深色（近黑）背景导致文字难以辨认
         let mut visuals = egui::Visuals::light();
-        visuals.window_fill = egui::Color32::from_rgb(250, 250, 252);
-        visuals.panel_fill = egui::Color32::from_rgb(240, 242, 246);
+        // 主背景色改为纯白
+        visuals.window_fill = egui::Color32::WHITE;
+        visuals.panel_fill = egui::Color32::WHITE;
         cc.egui_ctx.set_visuals(visuals);
         Self {
             excel_path: String::new(),

@@ -46,11 +46,13 @@ jobs:
           echo "--- generated files ---"
           ls selftest_out
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: barcode_tool
-          path: target/x86_64-pc-windows-msvc/release/barcode_tool.exe
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Compress with UPX (size reduction)
         if: startsWith(github.ref, 'refs/tags/')
@@ -62,10 +64,26 @@ jobs:
           echo "--- UPX 压缩后大小 ---"
           (Get-Item target/x86_64-pc-windows-msvc/release/barcode_tool.exe).Length
 
+      - name: Copy versioned executable
+        shell: pwsh
+        run: |
+          $v = "${{ env.VERSION }}"
+          $src = "target/x86_64-pc-windows-msvc/release/barcode_tool.exe"
+          $dst = "target/x86_64-pc-windows-msvc/release/barcode_tool_v$v.exe"
+          Copy-Item $src -Destination $dst -Force
+          echo "--- 版本化产物 ---"
+          Get-Item $dst | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: barcode_tool_v${{ env.VERSION }}
+          path: target/x86_64-pc-windows-msvc/release/barcode_tool_v${{ env.VERSION }}.exe
+
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/x86_64-pc-windows-msvc/release/barcode_tool.exe
+          files: target/x86_64-pc-windows-msvc/release/barcode_tool_v${{ env.VERSION }}.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
