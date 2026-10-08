@@ -1,10 +1,10 @@
-# barcode_tool (Rust 版)
+# barcode_tool
 
-从 Excel 指定列生成一维条形码图片的桌面工具。这是原 Python 版 `table_to_barcode` 的 **Rust 重写版**。
+从 Excel 指定列生成一维条形码图片的桌面工具。
 
 ## 功能
 
-1. 选择 Excel 文件（`.xlsx` / `.xls`）
+1. 选择表格文件（`.xlsx` / `.xls` / `.csv`）
 2. 读取指定行（默认第 2 行）作为列名，选择要生成条形码的列
 3. 把该列每个单元格的值生成一维条形码图片（PNG），导出到指定目录
 4. 可选“显示文字”：在条码下方绘制人眼可读文本（自动使用系统字体，缺失则仅输出条码）
@@ -25,9 +25,9 @@
   双击即可运行，无需安装（GUI 界面）。
 - **命令行自检**（无需界面，便于验证）：
   ```bash
-  barcode_tool.exe --selftest <excel路径> [输出目录] [列名行]
+  barcode_tool.exe --selftest <表格路径> [输出目录] [列名行]
   ```
-  例：`barcode_tool.exe --selftest demo.xlsx out 2`
+  例：`barcode_tool.exe --selftest sample.csv out 2`
 
 ## 从源码构建
 
@@ -39,22 +39,14 @@ cargo build --release
 ```
 
 > 本项目通过 GitHub Actions 在 `windows-latest` 上自动编译，并在推送 `v*` 标签时
-> 自动生成 GitHub Release 并上传 `barcode_tool.exe`。
-
-## 与原 Python 版的区别
-
-| 项目 | Python 版 | Rust 版 |
-|------|-----------|---------|
-| 语言 | Python + tkinter | Rust + eframe/egui |
-| 依赖 | openpyxl / python-barcode / Pillow | calamine / barcoders / image / imageproc |
-| 体积 | ~14 MB (PyInstaller) | 更小（Rust 原生编译） |
-| 条码引擎 | python-barcode | barcoders 2.0 |
+> 自动生成 GitHub Release 并上传 `barcode_tool_vX.Y.Z.exe`。
 
 ## 目录结构
 
 ```
 src/main.rs              程序入口 + GUI + 核心逻辑
 Cargo.toml              依赖与构建配置
+sample.csv              命令行自检用的示例数据
 .github/workflows/       自动构建与发布
 ```
 

@@ -2,7 +2,7 @@
 name = "barcode_tool"
 version = "2.0.6"
 edition = "2021"
-description = "从 Excel 指定列生成一维条形码图片（Rust 重写版）"
+description = "从 Excel 指定列生成一维条形码图片"
 license = "MIT"
 
 [dependencies]
