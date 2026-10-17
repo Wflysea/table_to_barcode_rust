@@ -44,6 +44,108 @@ fn is_digit_only(bt: &str) -> bool {
     matches!(bt, "ean13" | "ean8" | "upca")
 }
 
+// ----------------------- 更新检查 -----------------------
+//
+// 软件启动后会在后台请求 CNB 上的版本清单（releases/latest.json），
+// 与内置版本号比较；若有新版本，用户可一键从 CNB 下载并自动替换重启。
+
+/// 版本清单地址：CNB 仓库 releases/ 目录下的 latest.json，公开直链、无需登录。
+const UPDATE_JSON_URL: &str =
+    "https://cnb.cool/dahai1009/etb/-/git/raw/main/releases/latest.json";
+
+/// 版本清单结构（与 CNB 上 releases/latest.json 对应）
+#[derive(serde::Deserialize, Clone)]
+struct LatestInfo {
+    version: String,
+    #[serde(default)]
+    download_url: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    release_date: String,
+}
+
+/// 后台更新事件
+enum UpdateEvent {
+    Checking,
+    Available(LatestInfo),
+    UpToDate,
+    CheckError(String),
+    Downloading,
+    Downloaded(std::path::PathBuf),
+    DownloadError(String),
+}
+
+/// 把版本号解析为数字段，用于比较（忽略前缀 v，如 v2.0.8 -> [2,0,8]）
+fn parse_version(v: &str) -> Vec<u32> {
+    v.trim_start_matches('v')
+        .split(['.', '-'])
+        .filter_map(|s| s.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// 远端版本是否比本地新
+fn is_newer_version(remote: &str, local: &str) -> bool {
+    let r = parse_version(remote);
+    let l = parse_version(local);
+    let n = r.len().max(l.len());
+    for i in 0..n {
+        let rv = r.get(i).copied().unwrap_or(0);
+        let lv = l.get(i).copied().unwrap_or(0);
+        if rv != lv {
+            return rv > lv;
+        }
+    }
+    false
+}
+
+/// 应用更新：用下载好的新 exe 替换当前 exe 并重启。
+/// 若当前目录不可写（如装在 Program Files），则打开所在目录并返回提示文本（不退出）。
+fn apply_update(new_exe: &std::path::Path) -> String {
+    match std::env::current_exe() {
+        Ok(current) => match current.parent() {
+            Some(parent) => {
+                // 先探测当前目录是否可写
+                let probe =
+                    parent.join(format!(".write_test_{}.tmp", std::process::id()));
+                if std::fs::File::create(&probe).is_ok() {
+                    let _ = std::fs::remove_file(&probe);
+                    // 生成替换批处理：等待本进程退出后覆盖并重启
+                    let bat = std::env::temp_dir().join("barcode_tool_update.bat");
+                    let script = format!(
+                        "@echo off\r\n\
+timeout /t 2 /nobreak >nul\r\n\
+copy /Y \"{}\" \"{}\" >nul\r\n\
+start \"\" \"{}\"\r\n\
+del \"%~f0\"\r\n",
+                        new_exe.display(),
+                        current.display(),
+                        current.display()
+                    );
+                    if std::fs::write(&bat, script).is_ok() {
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/C", &bat.to_string_lossy()])
+                            .spawn();
+                        std::process::exit(0);
+                    }
+                }
+                // 目录不可写：打开文件夹，提示手动替换
+                let _ = open::that(parent);
+                format!(
+                    "当前目录不可写，已打开文件夹。请手动把已下载的新版 {} 复制到 {}",
+                    new_exe
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    current.display()
+                )
+            }
+            None => "无法确定当前程序所在目录。".to_string(),
+        },
+        Err(e) => format!("无法获取当前程序路径：{}", e),
+    }
+}
+
 /// 把单元格值转换为干净的字符串（整数不出现小数点）
 fn cell_text(d: &Data) -> String {
     format!("{}", d).trim().to_string()
@@ -534,6 +636,11 @@ struct AppState {
     busy: bool,
     font_data: Option<Vec<u8>>,
     rx: Option<std::sync::mpsc::Receiver<GenOutcome>>,
+    // 更新检查相关
+    update_rx: Option<std::sync::mpsc::Receiver<UpdateEvent>>,
+    update_available: Option<LatestInfo>,
+    update_status: String,
+    downloading: bool,
 }
 
 struct GenOutcome {
@@ -550,6 +657,40 @@ impl AppState {
         visuals.window_fill = egui::Color32::WHITE;
         visuals.panel_fill = egui::Color32::WHITE;
         cc.egui_ctx.set_visuals(visuals);
+
+        // 启动更新检查（后台线程，不阻塞 UI）
+        let (up_tx, up_rx) = channel::<UpdateEvent>();
+        {
+            let up_tx = up_tx;
+            thread::spawn(move || {
+                let _ = up_tx.send(UpdateEvent::Checking);
+                let result: anyhow::Result<LatestInfo> = (|| {
+                    let body = ureq::get(UPDATE_JSON_URL)
+                        .timeout(std::time::Duration::from_secs(20))
+                        .call()
+                        .map_err(|e| anyhow!("请求失败: {}", e))?
+                        .into_string()
+                        .map_err(|e| anyhow!("读取响应失败: {}", e))?;
+                    let info: LatestInfo = serde_json::from_str(&body)
+                        .map_err(|e| anyhow!("解析版本清单失败: {}", e))?;
+                    Ok(info)
+                })();
+                match result {
+                    Ok(info) => {
+                        let local = env!("CARGO_PKG_VERSION");
+                        if is_newer_version(&info.version, local) {
+                            let _ = up_tx.send(UpdateEvent::Available(info));
+                        } else {
+                            let _ = up_tx.send(UpdateEvent::UpToDate);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = up_tx.send(UpdateEvent::CheckError(e.to_string()));
+                    }
+                }
+            });
+        }
+
         Self {
             excel_path: String::new(),
             out_dir: String::new(),
@@ -568,6 +709,10 @@ impl AppState {
             busy: false,
             font_data: find_font(),
             rx: None,
+            update_rx: Some(up_rx),
+            update_available: None,
+            update_status: "正在检查更新…".into(),
+            downloading: false,
         }
     }
 
@@ -680,6 +825,75 @@ impl AppState {
             let _ = tx.send(outcome);
         });
     }
+
+    /// 手动或启动时触发：后台请求 CNB 版本清单并检查是否有新版本
+    fn start_update_check(&mut self) {
+        let (tx, rx) = channel::<UpdateEvent>();
+        self.update_rx = Some(rx);
+        self.update_available = None;
+        self.update_status = "正在检查更新…".into();
+        thread::spawn(move || {
+            let _ = tx.send(UpdateEvent::Checking);
+            let result: anyhow::Result<LatestInfo> = (|| {
+                let body = ureq::get(UPDATE_JSON_URL)
+                    .timeout(std::time::Duration::from_secs(20))
+                    .call()
+                    .map_err(|e| anyhow!("请求失败: {}", e))?
+                    .into_string()
+                    .map_err(|e| anyhow!("读取响应失败: {}", e))?;
+                let info: LatestInfo =
+                    serde_json::from_str(&body).map_err(|e| anyhow!("解析版本清单失败: {}", e))?;
+                Ok(info)
+            })();
+            match result {
+                Ok(info) => {
+                    let local = env!("CARGO_PKG_VERSION");
+                    if is_newer_version(&info.version, local) {
+                        let _ = tx.send(UpdateEvent::Available(info));
+                    } else {
+                        let _ = tx.send(UpdateEvent::UpToDate);
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(UpdateEvent::CheckError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// 下载远端新版本 exe 到临时目录（后台）
+    fn start_download(&mut self) {
+        if let Some(info) = self.update_available.clone() {
+            let (tx, rx) = channel::<UpdateEvent>();
+            self.update_rx = Some(rx);
+            self.downloading = true;
+            self.update_status = format!("正在下载 v{} …", info.version);
+            thread::spawn(move || {
+                let _ = tx.send(UpdateEvent::Downloading);
+                let result: anyhow::Result<std::path::PathBuf> = (|| {
+                    let tmp = std::env::temp_dir()
+                        .join(format!("barcode_tool_update_{}.exe", info.version));
+                    let mut resp = ureq::get(info.download_url.as_str())
+                        .timeout(std::time::Duration::from_secs(300))
+                        .call()
+                        .map_err(|e| anyhow!("下载失败: {}", e))?;
+                    let mut f = std::fs::File::create(&tmp)
+                        .map_err(|e| anyhow!("创建临时文件失败: {}", e))?;
+                    std::io::copy(&mut resp.into_reader(), &mut f)
+                        .map_err(|e| anyhow!("写入文件失败: {}", e))?;
+                    Ok(tmp)
+                })();
+                match result {
+                    Ok(path) => {
+                        let _ = tx.send(UpdateEvent::Downloaded(path));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(UpdateEvent::DownloadError(e.to_string()));
+                    }
+                }
+            });
+        }
+    }
 }
 
 impl eframe::App for AppState {
@@ -687,6 +901,22 @@ impl eframe::App for AppState {
         ui.label(
             "选择表格文件（Excel 或 CSV）→ 读取列名并选择条形码列 → 选择导出目录 → 生成。\n（列名行/数据起始行可调：默认列名在第 2 行、数据从第 3 行开始）",
         );
+
+        // ===== 更新检查 =====
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("更新：");
+            ui.label(&self.update_status);
+            if self.update_available.is_some() && !self.downloading {
+                if ui.button("下载并更新").clicked() {
+                    self.start_download();
+                }
+            }
+            if ui.button("检查更新").clicked() {
+                self.start_update_check();
+            }
+        });
+        ui.separator();
 
         ui.horizontal(|ui| {
             ui.label("表格文件");
@@ -788,6 +1018,56 @@ impl eframe::App for AppState {
                 }
             }
         }
+        // 接收后台更新事件
+        if let Some(rx) = self.update_rx.take() {
+            match rx.try_recv() {
+                Ok(ev) => match ev {
+                    UpdateEvent::Checking => {
+                        self.update_status = "正在检查更新…".into();
+                        self.update_rx = Some(rx);
+                    }
+                    UpdateEvent::UpToDate => {
+                        self.update_available = None;
+                        self.update_status =
+                            format!("已是最新版本 v{}", env!("CARGO_PKG_VERSION"));
+                    }
+                    UpdateEvent::Available(info) => {
+                        self.update_status = format!(
+                            "发现新版本 v{}（当前 v{}），可点击「下载并更新」",
+                            info.version,
+                            env!("CARGO_PKG_VERSION")
+                        );
+                        self.update_available = Some(info);
+                    }
+                    UpdateEvent::CheckError(e) => {
+                        self.update_status = format!("检查更新失败：{}", e);
+                    }
+                    UpdateEvent::Downloading => {
+                        self.downloading = true;
+                        self.update_rx = Some(rx);
+                    }
+                    UpdateEvent::Downloaded(path) => {
+                        self.downloading = false;
+                        self.update_status = "下载完成，正在应用更新…".into();
+                        // apply_update 若可自动替换会直接退出进程；否则返回提示文本
+                        let msg = apply_update(&path);
+                        self.update_status = msg;
+                    }
+                    UpdateEvent::DownloadError(e) => {
+                        self.downloading = false;
+                        self.update_status = format!("下载失败：{}", e);
+                    }
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // 暂无事件，保留接收端继续监听
+                    self.update_rx = Some(rx);
+                }
+                Err(_) => {
+                    // 发送端已断开，丢弃
+                }
+            }
+        }
+
         if self.busy {
             ui.ctx().request_repaint();
         }
