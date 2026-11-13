@@ -618,6 +618,65 @@ fn run_selftest(excel: &str, out_arg: &str, header_row: usize) -> Result<String>
 
 // ----------------------- GUI -----------------------
 
+/// 皮肤（明暗）主题：浅色=白底，深色=黑底
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// 把本主题应用到 egui 上下文（窗口/面板背景 + 对应文字色）
+    fn apply(self, ctx: &egui::Context) {
+        let mut visuals = match self {
+            Theme::Light => egui::Visuals::light(),
+            Theme::Dark => egui::Visuals::dark(),
+        };
+        match self {
+            Theme::Light => {
+                // 浅色：纯白背景（Visuals::light 默认深色文字，对比清晰）
+                visuals.window_fill = egui::Color32::WHITE;
+                visuals.panel_fill = egui::Color32::WHITE;
+            }
+            Theme::Dark => {
+                // 深色：近黑背景（Visuals::dark 默认浅色文字）
+                visuals.window_fill = egui::Color32::BLACK;
+                visuals.panel_fill = egui::Color32::BLACK;
+            }
+        }
+        ctx.set_visuals(visuals);
+    }
+}
+
+/// 配置文件路径：%APPDATA%/barcode_tool/config.json（始终可写，且不会随 exe 更新丢失）
+fn config_path() -> Option<PathBuf> {
+    std::env::var("APPDATA").ok().map(|p| Path::new(&p).join("barcode_tool").join("config.json"))
+}
+
+/// 读取已保存的皮肤设置，缺省浅色
+fn load_theme() -> Theme {
+    if let Some(p) = config_path() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(t) = serde_json::from_str::<Theme>(&s) {
+                return t;
+            }
+        }
+    }
+    Theme::Light
+}
+
+/// 保存皮肤设置到配置文件
+fn save_theme(theme: Theme) {
+    if let Some(p) = config_path() {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(s) = serde_json::to_string(&theme) {
+            let _ = std::fs::write(&p, s);
+        }
+    }
+}
+
 struct AppState {
     excel_path: String,
     out_dir: String,
@@ -641,6 +700,8 @@ struct AppState {
     update_available: Option<LatestInfo>,
     update_status: String,
     downloading: bool,
+    // 皮肤（明暗）主题，运行时可切换并持久化
+    theme: Theme,
 }
 
 struct GenOutcome {
@@ -651,12 +712,9 @@ struct GenOutcome {
 impl AppState {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         register_cjk_font(&cc.egui_ctx);
-        // 使用浅色高对比主题，避免默认深色（近黑）背景导致文字难以辨认
-        let mut visuals = egui::Visuals::light();
-        // 主背景色改为纯白
-        visuals.window_fill = egui::Color32::WHITE;
-        visuals.panel_fill = egui::Color32::WHITE;
-        cc.egui_ctx.set_visuals(visuals);
+        // 应用已保存的皮肤设置（缺省浅色），支持运行时切换为深色
+        let theme = load_theme();
+        theme.apply(&cc.egui_ctx);
 
         // 启动更新检查（后台线程，不阻塞 UI）
         let (up_tx, up_rx) = channel::<UpdateEvent>();
@@ -713,6 +771,7 @@ impl AppState {
             update_available: None,
             update_status: "正在检查更新…".into(),
             downloading: false,
+            theme,
         }
     }
 
@@ -901,6 +960,19 @@ impl eframe::App for AppState {
         ui.label(
             "选择表格文件（Excel 或 CSV）→ 读取列名并选择条形码列 → 选择导出目录 → 生成。\n（列名行/数据起始行可调：默认列名在第 2 行、数据从第 3 行开始）",
         );
+
+        // ===== 皮肤（明暗）设置 =====
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("皮肤：");
+            let old = self.theme;
+            ui.selectable_value(&mut self.theme, Theme::Light, "浅色");
+            ui.selectable_value(&mut self.theme, Theme::Dark, "深色");
+            if self.theme != old {
+                self.theme.apply(ui.ctx());
+                save_theme(self.theme);
+            }
+        });
 
         // ===== 更新检查 =====
         ui.separator();
